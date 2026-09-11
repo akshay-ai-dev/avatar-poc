@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Avatar E5</title>
+<style>
+  :root{--bg:#0b0d10;--line:#262b33;--ink:#e8eaed;--dim:#9aa3af;--ok:#34d399;--acc:#3b82f6;--err:#f87171}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,sans-serif}
+  .wrap{max-width:560px;margin:0 auto;padding:14px 16px 40px}
+  h1{font-size:16px;margin:4px 0 12px}
+  canvas{width:100%;height:auto;display:block;border-radius:14px;background:#000}
+  .row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center}
+  select,textarea,button{font:15px system-ui;border-radius:9px;border:1px solid var(--line);background:#0f1216;color:var(--ink);padding:9px}
+  select{flex:1;min-width:0} textarea{width:100%;resize:vertical}
+  button{background:#1c2027;cursor:pointer} button.p{background:var(--acc);border-color:var(--acc);color:#fff}
+  button:disabled{opacity:.4}
+  .dim{color:var(--dim);font-size:13px} .big{font:600 20px ui-monospace,monospace;color:var(--ok)}
+  .err{color:var(--err)}
+</style></head><body><div class="wrap">
+<h1>Photorealistic avatar · E5 (INT8 MuseTalk + fast Kokoro, 10 fps)</h1>
+<canvas id="cv" width="512" height="512"></canvas>
+<div class="row"><select id="avatar" disabled></select><select id="voice"></select></div>
+<div class="row">
+  <button id="connect" class="p">Connect</button><button id="disconnect" disabled>Disconnect</button>
+  <span id="status" class="dim">press Connect</span>
+</div>
+<div class="row"><textarea id="text" rows="3">Hello! Bob picked up the map, and Pam met him by the big maple tree.</textarea></div>
+<div class="row">
+  <button id="say" class="p" disabled>Speak</button>
+  <span class="dim">time to first frame</span> <span id="ttff" class="big">—</span>
+</div>
+<div class="dim" style="margin-top:12px" id="foot"></div>
+</div>
+<script src="lk.js"></script>
+<script src="config.js"></script>
+<script>
+const C = window.E5, $ = s => document.querySelector(s);
+$('#foot').textContent = `Tokens valid until ${C.expires_local}. Everyone on this page shares one avatar room.`;
+const im = src => new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = src; });
+
+/* blink: final-poc Erlang-2 scheduler, wall-clock driven */
+class Blink{
+  constructor(n){ this.n=n; this.fps=25; this.dur=n/25; this.speaking=false; this.t0=null; this.dbl=false;
+                  this.next=performance.now()/1000+this.gap(); }
+  gap(){ const th=this.speaking?1.1018:1.6427, cap=this.speaking?4.5:6.0;
+         const on=-th*(Math.log(1-Math.random())+Math.log(1-Math.random()));
+         return Math.max(0.45, Math.min(on,cap)-this.dur); }
+  tick(){ const now=performance.now()/1000;
+    if(this.t0!==null){ const k=Math.floor((now-this.t0)*this.fps);
+      if(k>=this.n){ this.t0=null; if(this.dbl){this.dbl=false; this.next=now+0.12;} return null; } return k; }
+    if(now>=this.next){ this.t0=now; this.dbl=Math.random()<0.12; if(!this.dbl) this.next=now+this.dur+this.gap(); return 0; }
+    return null; }
+}
+
+/* compositor: background + person + blink + mouth patch (the only video); latest frame, no cross-fade */
+const cv = $('#cv'), ctx = cv.getContext('2d', {alpha:false});
+const pcv = document.createElement('canvas'), pctx = pcv.getContext('2d');
+let L = null, video = null, running = false, bg = null;
+async function setup(aid){
+  if(L && L.aid === aid) return;
+  const a = C.avatars[aid];
+  bg = bg || await im('assets/background.png');
+  const [base, sprite, mask] = await Promise.all([im(`assets/${aid}/base_rgba.png`),
+    im(`assets/${aid}/blink_sprite.png`), im(`assets/${aid}/patch_alpha.png`)]);
+  L = {aid, a, base, sprite, mask, blink: new Blink(a.blink_n)};
+  pcv.width = a.patch_box[2]; pcv.height = a.patch_box[3];
+  $('#avatar').value = aid; draw();
+}
+function draw(){
+  if(!L) return;
+  const {a, base, sprite, mask, blink} = L;
+  const s = Math.max(512/bg.width, 512/bg.height), w = bg.width*s, h = bg.height*s;
+  ctx.drawImage(bg, (512-w)/2, (512-h)/2, w, h);
+  ctx.drawImage(base, 0, 0, 512, 512);
+  const k = blink.tick();
+  if(k !== null && k > 0){ const [ex,ey,ew,eh] = a.eye_box; ctx.drawImage(sprite, k*ew, 0, ew, eh, ex, ey, ew, eh); }
+  if(video && video.readyState >= 2 && video.videoWidth > 0){
+    const [px,py,pw,ph] = a.patch_box;
+    pctx.globalCompositeOperation = 'source-over'; pctx.clearRect(0,0,pw,ph);
+    pctx.drawImage(video, 0, 0, pw, ph, 0, 0, pw, ph);          // crop the fixed canvas
+    pctx.globalCompositeOperation = 'destination-in'; pctx.drawImage(mask, 0, 0, pw, ph);
+    ctx.drawImage(pcv, px, py);
+  }
+}
+function loop(){ if(!running) return; draw(); requestAnimationFrame(loop); }
+
+/* LiveKit: media in, commands out as data messages (topic e5-cmd) */
+let room = null, audioEl = null;
+const send = m => room && room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(m)),
+                                                            {reliable: true, topic: 'e5-cmd'});
+function token(){
+  const who = parseInt(new URLSearchParams(location.search).get('who'));
+  return C.tokens[Number.isInteger(who) ? who % C.tokens.length : Math.floor(Math.random()*C.tokens.length)];
+}
+async function connect(){
+  $('#connect').disabled = true; $('#status').textContent = 'connecting…'; $('#status').className = 'dim';
+  try{
+    room = new LivekitClient.Room({adaptiveStream:false, dynacast:false});
+    room.on(LivekitClient.RoomEvent.TrackSubscribed, (t) => {
+      if(t.kind === 'video'){ video = t.attach(); video.muted = true; video.playsInline = true;
+                              video.style.display = 'none'; document.body.appendChild(video); }
+      else { audioEl = t.attach(); audioEl.style.display = 'none'; document.body.appendChild(audioEl);
+             audioEl.play().catch(()=>{}); }
+    });
+    room.on(LivekitClient.RoomEvent.DataReceived, async (payload, p, kind, topic) => {
+      if(topic !== 'e5') return;
+      let m; try { m = JSON.parse(new TextDecoder().decode(payload)); } catch { return; }
+      if(m.type === 'state'){ await setup(m.avatar.avatar_id); if(!$('#voice').dataset.touched) $('#voice').value = m.voice;
+                              $('#avatar').disabled = false; $('#say').disabled = false;
+                              $('#status').textContent = 'connected'; $('#status').className = 'dim'; }
+      if(m.type === 'ttff') $('#ttff').textContent = m.ms + ' ms';
+      if(m.type === 'speaking' && L) L.blink.speaking = !!m.value;
+    });
+    room.on(LivekitClient.RoomEvent.Disconnected, () => { $('#status').textContent = 'disconnected'; });
+    await room.connect(C.url, token());
+    running = true; requestAnimationFrame(loop);
+    $('#disconnect').disabled = false;
+    setTimeout(() => { if(room && room.remoteParticipants.size === 0){
+      $('#status').textContent = 'the avatar service is not running right now'; $('#status').className = 'err'; } }, 4000);
+    send({cmd: 'state'});
+  }catch(e){ $('#status').textContent = 'connect failed: ' + e.message; $('#status').className = 'err';
+             $('#connect').disabled = false; }
+}
+async function disconnect(){
+  running = false; if(room){ try{ await room.disconnect(); }catch{} room = null; }
+  for(const el of [video, audioEl]) if(el && el.parentNode) el.remove();
+  video = audioEl = null; draw();
+  $('#connect').disabled = false; $('#disconnect').disabled = true; $('#say').disabled = true; $('#avatar').disabled = true;
+  $('#status').textContent = 'disconnected';
+}
+function speak(){ if(audioEl) audioEl.play().catch(()=>{}); $('#ttff').textContent = '…';
+                  send({cmd: 'say', text: $('#text').value, voice: $('#voice').value}); }
+
+/* init: dropdowns from config; preview the first avatar before connecting */
+for(const aid of Object.keys(C.avatars)){ const o = document.createElement('option'); o.value = o.textContent = aid; $('#avatar').appendChild(o); }
+for(const [g, list] of Object.entries(C.voices)){ const og = document.createElement('optgroup'); og.label = g.replace(/_/g,' ');
+  for(const v of list){ const o = document.createElement('option'); o.value = o.textContent = v; if(v === C.default_voice) o.selected = true; og.appendChild(o); }
+  $('#voice').appendChild(og); }
+$('#voice').onchange = () => { $('#voice').dataset.touched = '1'; };
+$('#avatar').onchange = () => send({cmd: 'avatar', id: $('#avatar').value});
+$('#connect').onclick = connect; $('#disconnect').onclick = disconnect; $('#say').onclick = speak;
+$('#text').addEventListener('keydown', e => { if((e.ctrlKey||e.metaKey) && e.key === 'Enter') speak(); });
+setup(Object.keys(C.avatars)[0]);
+</script></body></html>
