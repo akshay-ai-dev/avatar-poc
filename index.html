@@ -15,9 +15,21 @@
   button:disabled{opacity:.4}
   .dim{color:var(--dim);font-size:13px} .big{font:600 20px ui-monospace,monospace;color:var(--ok)}
   .err{color:var(--err)}
+  .stage{position:relative}
+  .cap{position:absolute;left:4%;right:4%;bottom:4%;padding:8px 12px;border-radius:10px;
+       background:rgba(0,0,0,.62);font:600 17px/1.35 system-ui,sans-serif;text-align:center;
+       min-height:1.35em;display:none}
+  .cap.on{display:block}
+  .cap span{transition:color .08s linear}
+  .cap .n{color:rgba(255,255,255,.38)}           /* not spoken yet */
+  .cap .c{color:#fde047}                          /* being spoken now */
+  .cap .d{color:#fff}                             /* already spoken */
+  #tx{margin-top:10px;max-height:160px;overflow:auto;font-size:14px;color:var(--dim);
+      border:1px solid var(--line);border-radius:9px;padding:8px 10px;display:none}
+  #tx div{margin:2px 0} #tx .you{color:var(--ink)}
 </style></head><body><div class="wrap">
 <h1>Photorealistic avatar · E5 (INT8 MuseTalk + fast Kokoro, 10 fps)</h1>
-<canvas id="cv" width="512" height="512"></canvas>
+<div class="stage"><canvas id="cv" width="512" height="512"></canvas><div id="cap" class="cap"></div></div>
 <div class="row"><select id="avatar" disabled></select><select id="voice"></select></div>
 <div class="row">
   <button id="connect" class="p">Connect</button><button id="disconnect" disabled>Disconnect</button>
@@ -28,6 +40,7 @@
   <button id="say" class="p" disabled>Speak</button>
   <span class="dim">time to first frame</span> <span id="ttff" class="big">—</span>
 </div>
+<div id="tx"></div>
 <div class="dim" style="margin-top:12px" id="foot"></div>
 </div>
 <script src="lk.js"></script>
@@ -35,6 +48,7 @@
 <script>
 const C = window.E5, $ = s => document.querySelector(s);
 $('#foot').textContent = `Tokens valid until ${C.expires_local}. Everyone on this page shares one avatar room.`;
+setTimeout(() => { $('#foot').textContent += ` Caption delay ${CAP_DELAY} ms (add ?cd=NN to the URL to adjust).`; });
 const im = src => new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = src; });
 
 /* blink: final-poc Erlang-2 scheduler, wall-clock driven */
@@ -81,7 +95,34 @@ function draw(){
     ctx.drawImage(pcv, px, py);
   }
 }
-function loop(){ if(!running) return; draw(); requestAnimationFrame(loop); }
+/* captions: the service sends each sentence's word timeline together with that sentence's first
+   video frame, so t0 = arrival + CAP_DELAY (the video's decode path) is when the sentence's first
+   frame is on screen and its first sample is audible. Words light up at t0 + word.s. */
+const CAP_DELAY = (() => { const q = new URLSearchParams(location.search).get('cd');
+                           return q !== null ? Number(q) : (C.caption_delay_ms ?? 40); })();
+let cap = null;                                   // {t0, spans:[{el,s,e}], text}
+const capEl = $('#cap'), txEl = $('#tx');
+function transcript(text, cls){ const d = document.createElement('div'); d.textContent = text;
+  if(cls) d.className = cls; txEl.appendChild(d); txEl.style.display = 'block'; txEl.scrollTop = txEl.scrollHeight; }
+function showPending(text){                       // typed text, before any of it is spoken
+  cap = null; capEl.innerHTML = ''; const s = document.createElement('span'); s.className = 'n';
+  s.textContent = text; capEl.appendChild(s); capEl.classList.add('on'); }
+function startCaption(m){
+  if(cap && cap.text) transcript(cap.text);       // previous sentence is finished
+  capEl.innerHTML = '';
+  const spans = (m.words || []).map(w => { const el = document.createElement('span');
+    el.textContent = w.w; el.className = 'n'; capEl.appendChild(el); return {el, s: w.s*1000, e: w.e*1000}; });
+  cap = {t0: performance.now() + CAP_DELAY, spans, text: m.text || (m.words||[]).map(w => w.w).join(''),
+         end: (m.dur || 0) * 1000, last: !!m.last};
+  capEl.classList.add('on');
+}
+function tickCaption(){
+  if(!cap) return;
+  const t = performance.now() - cap.t0;
+  for(const x of cap.spans){ const k = t >= x.e ? 'd' : (t >= x.s ? 'c' : 'n'); if(x.el.className !== k) x.el.className = k; }
+  if(cap.last && t > cap.end + 1500){ transcript(cap.text); cap = null; capEl.classList.remove('on'); }
+}
+function loop(){ if(!running) return; draw(); tickCaption(); requestAnimationFrame(loop); }
 
 /* LiveKit: media in, commands out as data messages (topic e5-cmd) */
 let room = null, audioEl = null;
@@ -108,6 +149,8 @@ async function connect(){
                               $('#avatar').disabled = false; $('#say').disabled = false;
                               $('#status').textContent = 'connected'; $('#status').className = 'dim'; }
       if(m.type === 'ttff') $('#ttff').textContent = m.ms + ' ms';
+      if(m.type === 'utterance'){ if(cap && cap.text) transcript(cap.text); transcript('you: ' + m.text, 'you'); showPending(m.text); }
+      if(m.type === 'caption') startCaption(m);
       if(m.type === 'speaking' && L) L.blink.speaking = !!m.value;
     });
     room.on(LivekitClient.RoomEvent.Disconnected, () => { $('#status').textContent = 'disconnected'; });
